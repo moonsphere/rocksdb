@@ -1831,6 +1831,13 @@ class ZSTDStreamingCompress final : public StreamingCompress {
     cctx_ = ZSTD_createCCtx();
     // Each compressed frame will have a checksum
     ZSTD_CCtx_setParameter(cctx_, ZSTD_c_checksumFlag, 1);
+    // WAL compression runs in the write path. Prefer a fast zstd mode over
+    // zstd's default level so compression does not dominate the WAL writer.
+    const int level =
+        opts_.level == CompressionOptions::kDefaultCompressionLevel
+            ? -5
+            : opts_.level;
+    ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, level);
     assert(cctx_ != nullptr);
     input_buffer_ = {/*src=*/nullptr, /*size=*/0, /*pos=*/0};
 #endif

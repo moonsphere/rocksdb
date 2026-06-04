@@ -1646,6 +1646,7 @@ INSTANTIATE_TEST_CASE_P(
                                             RecoveryTestHelper::kWALFilesCount,
                                         1),
                        ::testing::Values(CompressionType::kNoCompression,
+                                         CompressionType::kLZ4Compression,
                                          CompressionType::kZSTD)));
 
 class DBWALTestWithParamsVaryingRecoveryMode
@@ -1670,6 +1671,7 @@ INSTANTIATE_TEST_CASE_P(
                           WALRecoveryMode::kPointInTimeRecovery,
                           WALRecoveryMode::kSkipAnyCorruptedRecords),
         ::testing::Values(CompressionType::kNoCompression,
+                          CompressionType::kLZ4Compression,
                           CompressionType::kZSTD)));
 
 // Test scope:

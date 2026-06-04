@@ -10,6 +10,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #ifdef ROCKSDB_MALLOC_USABLE_SIZE
 #ifdef OS_FREEBSD
@@ -569,11 +570,21 @@ inline bool ZSTD_Streaming_Supported() {
 #endif
 }
 
+inline bool LZ4_Streaming_Supported() {
+#if defined(LZ4)
+  return true;
+#else
+  return false;
+#endif
+}
+
 inline bool StreamingCompressionTypeSupported(
     CompressionType compression_type) {
   switch (compression_type) {
     case kNoCompression:
       return true;
+    case kLZ4Compression:
+      return LZ4_Streaming_Supported();
     case kZSTD:
       return ZSTD_Streaming_Supported();
     default:
@@ -1818,6 +1829,50 @@ class StreamingUncompress {
   CompressionType compression_type_;
   uint32_t compress_format_version_;
   size_t max_output_len_;
+};
+
+class LZ4StreamingCompress final : public StreamingCompress {
+ public:
+  explicit LZ4StreamingCompress(const CompressionOptions& opts,
+                                uint32_t compress_format_version,
+                                size_t max_output_len)
+      : StreamingCompress(kLZ4Compression, opts, compress_format_version,
+                          max_output_len),
+        output_offset_(0) {}
+  int Compress(const char* input, size_t input_size, char* output,
+               size_t* output_pos) override;
+  void Reset() override;
+
+ private:
+  bool BuildCompressedOutput(const char* input, size_t input_size);
+
+  std::string compressed_output_;
+  size_t output_offset_;
+};
+
+class LZ4StreamingUncompress final : public StreamingUncompress {
+ public:
+  explicit LZ4StreamingUncompress(uint32_t compress_format_version,
+                                  size_t max_output_len)
+      : StreamingUncompress(kLZ4Compression, compress_format_version,
+                            max_output_len),
+        output_offset_(0) {}
+  int Uncompress(const char* input, size_t input_size, char* output,
+                 size_t* output_pos) override;
+  void Reset() override;
+
+ private:
+  enum class DecodeResult {
+    kDone,
+    kIncomplete,
+    kError,
+  };
+
+  DecodeResult DecodeNextChunk();
+
+  std::string pending_input_;
+  std::string pending_output_;
+  size_t output_offset_;
 };
 
 class ZSTDStreamingCompress final : public StreamingCompress {

@@ -1102,6 +1102,11 @@ TEST_P(CompressionLogTest, AlignedFragmentation) {
     ROCKSDB_GTEST_SKIP("Test requires support for compression type");
     return;
   }
+  if (compression_type == kLZ4Compression) {
+    ROCKSDB_GTEST_SKIP(
+        "LZ4 small-record encoding makes this alignment filler expensive");
+    return;
+  }
   ASSERT_OK(SetupTestEnv());
   Random rnd(301);
   int num_filler_records = 0;
@@ -1132,6 +1137,7 @@ INSTANTIATE_TEST_CASE_P(
     Compression, CompressionLogTest,
     ::testing::Combine(::testing::Values(0, 1), ::testing::Bool(),
                        ::testing::Values(CompressionType::kNoCompression,
+                                         CompressionType::kLZ4Compression,
                                          CompressionType::kZSTD)));
 
 class StreamingCompressionTest
@@ -1200,7 +1206,8 @@ INSTANTIATE_TEST_CASE_P(
     StreamingCompression, StreamingCompressionTest,
     ::testing::Combine(::testing::Values(10, 100, 1000, kBlockSize,
                                          kBlockSize * 2),
-                       ::testing::Values(CompressionType::kZSTD)));
+                       ::testing::Values(CompressionType::kLZ4Compression,
+                                         CompressionType::kZSTD)));
 
 }  // namespace log
 }  // namespace ROCKSDB_NAMESPACE

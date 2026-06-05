@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -88,6 +89,10 @@ class Writer {
 
   IOStatus AddRecord(const Slice& slice,
                      Env::IOPriority rate_limiter_priority = Env::IO_TOTAL);
+  IOStatus PrepareRecord(const Slice& slice, std::string* prepared);
+  IOStatus AddPreparedRecord(
+      const Slice& slice, Env::IOPriority rate_limiter_priority = Env::IO_TOTAL,
+      bool flush = true);
   IOStatus AddCompressionTypeRecord();
 
   // If there are column families in `cf_to_ts_sz` not included in
@@ -103,6 +108,8 @@ class Writer {
   const WritableFileWriter* file() const { return dest_.get(); }
 
   uint64_t get_log_number() const { return log_number_; }
+
+  bool IsCompressionEnabled() const { return compress_ != nullptr; }
 
   IOStatus WriteBuffer();
 
@@ -124,6 +131,9 @@ class Writer {
   IOStatus EmitPhysicalRecord(
       RecordType type, const char* ptr, size_t length,
       Env::IOPriority rate_limiter_priority = Env::IO_TOTAL);
+  IOStatus EmitLogicalRecord(
+      const Slice& slice, Env::IOPriority rate_limiter_priority = Env::IO_TOTAL,
+      bool flush = true);
 
   // If true, it does not flush after each write. Instead it relies on the upper
   // layer to manually does the flush by calling ::WriteBuffer()

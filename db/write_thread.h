@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -35,6 +36,10 @@ struct CommitRequest;
 
 class ColumnFamilySet;
 class FlushScheduler;
+
+namespace log {
+class Writer;
+}  // namespace log
 
 class RequestQueue {
  public:
@@ -94,6 +99,10 @@ class WriteThread {
     // A state indicating that the thread may be waiting using StateMutex()
     // and StateCondVar()
     STATE_LOCKED_WAITING = 32,
+
+    // The state used to inform a waiting writer that it should prepare its WAL
+    // record payload outside the single WAL writer path.
+    STATE_PARALLEL_WAL_PRECOMPRESSOR = 64,
   };
 
   struct Writer;
@@ -106,6 +115,7 @@ class WriteThread {
     Status status;
     std::atomic<size_t> running;
     size_t size = 0;
+    log::Writer* wal_precompress_log_writer = nullptr;
 
     struct Iterator {
       Writer* writer;
@@ -199,6 +209,10 @@ class WriteThread {
     Status status;  // write protected by status_lock in multi batch write.
     SpinMutex status_lock;
     Status callback_status;  // status returned by callback->Callback()
+    std::vector<std::string> prepared_wal_records;
+    size_t prepared_wal_record_bytes;
+    size_t prepared_write_with_wal;
+    WriteBatch* prepared_recoverable_state;
 
     std::aligned_storage<sizeof(std::mutex)>::type state_mutex_bytes;
     std::aligned_storage<sizeof(std::condition_variable)>::type state_cv_bytes;
@@ -226,6 +240,9 @@ class WriteThread {
           write_group(nullptr),
           request(nullptr),
           sequence(kMaxSequenceNumber),
+          prepared_wal_record_bytes(0),
+          prepared_write_with_wal(0),
+          prepared_recoverable_state(nullptr),
           link_older(nullptr),
           link_newer(nullptr) {}
 
@@ -253,6 +270,9 @@ class WriteThread {
           write_group(nullptr),
           request(nullptr),
           sequence(kMaxSequenceNumber),
+          prepared_wal_record_bytes(0),
+          prepared_write_with_wal(0),
+          prepared_recoverable_state(nullptr),
           link_older(nullptr),
           link_newer(nullptr) {
       multi_batch.batches.push_back(_batch);
@@ -281,6 +301,9 @@ class WriteThread {
           write_group(nullptr),
           request(nullptr),
           sequence(kMaxSequenceNumber),
+          prepared_wal_record_bytes(0),
+          prepared_write_with_wal(0),
+          prepared_recoverable_state(nullptr),
           link_older(nullptr),
           link_newer(nullptr),
           multi_batch(std::move(_batch)) {}
@@ -451,6 +474,11 @@ class WriteThread {
   //
   // WriteGroup* write_group: Extra state used to coordinate the parallel add
   void LaunchParallelMemTableWriters(WriteGroup* write_group);
+
+  void LaunchParallelWalPrecompressors(WriteGroup* write_group,
+                                       log::Writer* log_writer);
+
+  bool CompleteParallelWalPrecompressor(Writer* w);
 
   // Reports the completion of w's batch to the parallel group leader, and
   // waits for the rest of the parallel batch to complete.  Returns true

@@ -1096,6 +1096,32 @@ TEST_P(CompressionLogTest, Fragmentation) {
   ASSERT_EQ("EOF", Read());
 }
 
+TEST_P(CompressionLogTest, PreparedReadWrite) {
+  CompressionType compression_type = std::get<2>(GetParam());
+  if (!StreamingCompressionTypeSupported(compression_type)) {
+    ROCKSDB_GTEST_SKIP("Test requires support for compression type");
+    return;
+  }
+  ASSERT_OK(SetupTestEnv());
+  Random rnd(301);
+  const std::vector<std::string> wal_entries = {
+      "small",
+      "",
+      rnd.RandomBinaryString(3 * kBlockSize / 2),
+      rnd.RandomBinaryString(3 * kBlockSize),
+  };
+  for (const std::string& wal_entry : wal_entries) {
+    std::string prepared;
+    ASSERT_OK(writer_->PrepareRecord(Slice(wal_entry), &prepared));
+    ASSERT_OK(writer_->AddPreparedRecord(Slice(prepared)));
+  }
+
+  for (const std::string& wal_entry : wal_entries) {
+    ASSERT_EQ(wal_entry, Read());
+  }
+  ASSERT_EQ("EOF", Read());
+}
+
 TEST_P(CompressionLogTest, AlignedFragmentation) {
   CompressionType compression_type = std::get<2>(GetParam());
   if (!StreamingCompressionTypeSupported(compression_type)) {

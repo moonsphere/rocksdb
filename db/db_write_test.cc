@@ -16,6 +16,7 @@
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "test_util/sync_point.h"
+#include "util/compression.h"
 #include "util/random.h"
 #include "util/string_util.h"
 #include "utilities/fault_injection_env.h"
@@ -857,6 +858,84 @@ TEST_P(DBWriteTest, MultiThreadWrite) {
   }
 
   Close();
+}
+
+TEST_P(DBWriteTest, MultiBatchWriteWithCompressedWALPrecompression) {
+  Options options = GetOptions();
+  if (!options.enable_multi_batch_write) {
+    return;
+  }
+  if (!StreamingCompressionTypeSupported(kZSTD)) {
+    ROCKSDB_GTEST_SKIP("Test requires zstd streaming compression support");
+    return;
+  }
+
+  constexpr int kNumThreads = 4;
+  constexpr int kNumBatches = 2;
+  options.wal_compression = kZSTD;
+  options.write_buffer_size = 1024 * 1024 * 128;
+  Reopen(options);
+
+  std::atomic<int> ready_count{0};
+  std::atomic<int> leader_count{0};
+  std::atomic<int> precompress_count{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::JoinBatchGroup:Wait", [&](void* arg) {
+        ready_count++;
+        auto* w = reinterpret_cast<WriteThread::Writer*>(arg);
+        if (w->state == WriteThread::STATE_GROUP_LEADER) {
+          leader_count++;
+          while (ready_count < kNumThreads) {
+          }
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "WriteThread::LaunchParallelWalPrecompressors", [&](void* arg) {
+        auto* wg = reinterpret_cast<WriteThread::WriteGroup*>(arg);
+        ASSERT_GT(wg->size, 1);
+        precompress_count++;
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::vector<port::Thread> threads;
+  for (int t = 0; t < kNumThreads; t++) {
+    threads.emplace_back([&, t] {
+      WriteOptions opt;
+      std::vector<WriteBatch> data(kNumBatches);
+      std::vector<WriteBatch*> batches;
+      for (int b = 0; b < kNumBatches; b++) {
+        ASSERT_OK(
+            data[b].Put("key_" + std::to_string(t) + "_" + std::to_string(b),
+                        std::string(100 * 1024, 'a' + t)));
+        batches.push_back(&data[b]);
+      }
+      if (t == 0) {
+        ASSERT_OK(data[0].Put("wal_term_keep", "keep"));
+        data[0].MarkWalTerminationPoint();
+        ASSERT_OK(data[0].Put("wal_term_drop", "drop"));
+      }
+      ASSERT_OK(dbfull()->MultiBatchWrite(opt, std::move(batches)));
+    });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(1, leader_count);
+  ASSERT_GT(precompress_count, 0);
+
+  Reopen(options);
+  for (int t = 0; t < kNumThreads; t++) {
+    for (int b = 0; b < kNumBatches; b++) {
+      ASSERT_EQ(std::string(100 * 1024, 'a' + t),
+                Get("key_" + std::to_string(t) + "_" + std::to_string(b)));
+    }
+  }
+  ASSERT_EQ("keep", Get("wal_term_keep"));
+  ASSERT_EQ("NOT_FOUND", Get("wal_term_drop"));
 }
 
 class SimpleCallback : public PostWriteCallback {

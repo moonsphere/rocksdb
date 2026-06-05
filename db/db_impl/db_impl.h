@@ -2104,6 +2104,14 @@ class DBImpl : public DB {
                       SequenceNumber sequence,
                       LogFileNumberSize& log_file_number_size);
 
+  IOStatus PrepareWALRecords(WriteThread::Writer* writer,
+                             log::Writer* log_writer);
+
+  IOStatus WritePreparedWALRecords(const WriteThread::WriteGroup& write_group,
+                                   log::Writer* log_writer, uint64_t* log_used,
+                                   bool need_log_sync, bool need_log_dir_sync,
+                                   LogFileNumberSize& log_file_number_size);
+
   IOStatus ConcurrentWriteToWAL(const WriteThread::WriteGroup& write_group,
                                 uint64_t* log_used,
                                 SequenceNumber* last_sequence, size_t seq_inc);

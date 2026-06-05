@@ -259,6 +259,12 @@ Status DBImpl::MultiBatchWriteImpl(const WriteOptions& write_options,
   writer.request = &request;
   write_thread_.JoinBatchGroup(&writer);
 
+  if (writer.state == WriteThread::STATE_PARALLEL_WAL_PRECOMPRESSOR) {
+    writer.status = PrepareWALRecords(
+        &writer, writer.write_group->wal_precompress_log_writer);
+    write_thread_.CompleteParallelWalPrecompressor(&writer);
+  }
+
   WriteContext write_context;
   if (writer.state == WriteThread::STATE_GROUP_LEADER) {
     WriteThread::WriteGroup wal_write_group;
@@ -324,7 +330,21 @@ Status DBImpl::MultiBatchWriteImpl(const WriteOptions& write_options,
       RecordInHistogram(stats_, BYTES_PER_WRITE, total_byte_size);
 
       PERF_TIMER_STOP(write_pre_and_post_process_time);
+      bool wal_records_prepared = false;
       if (!write_options.disableWAL) {
+        if (log_context.writer->IsCompressionEnabled() &&
+            wal_write_group.size > 1) {
+          write_thread_.LaunchParallelWalPrecompressors(&wal_write_group,
+                                                        log_context.writer);
+          writer.status = PrepareWALRecords(&writer, log_context.writer);
+          write_thread_.CompleteParallelWalPrecompressor(&writer);
+          wal_records_prepared = writer.status.ok();
+          if (!writer.status.ok()) {
+            io_s = status_to_io_status(Status(writer.status));
+          }
+        }
+      }
+      if (writer.status.ok() && !write_options.disableWAL) {
         PERF_TIMER_GUARD(write_wal_time);
         stats->AddDBStats(InternalStats::kIntStatsWriteDoneBySelf, 1);
         RecordTick(stats_, WRITE_DONE_BY_SELF, 1);
@@ -337,10 +357,17 @@ Status DBImpl::MultiBatchWriteImpl(const WriteOptions& write_options,
         assert(log_context.log_file_number_size);
         LogFileNumberSize& log_file_number_size =
             *(log_context.log_file_number_size);
-        io_s =
-            WriteToWAL(wal_write_group, log_context.writer, log_used,
-                       log_context.need_log_sync, log_context.need_log_dir_sync,
-                       current_sequence, log_file_number_size);
+        if (wal_records_prepared) {
+          io_s = WritePreparedWALRecords(wal_write_group, log_context.writer,
+                                         log_used, log_context.need_log_sync,
+                                         log_context.need_log_dir_sync,
+                                         log_file_number_size);
+        } else {
+          io_s = WriteToWAL(wal_write_group, log_context.writer, log_used,
+                            log_context.need_log_sync,
+                            log_context.need_log_dir_sync, current_sequence,
+                            log_file_number_size);
+        }
         writer.status = io_s;
       }
     }
@@ -389,8 +416,8 @@ Status DBImpl::MultiBatchWriteImpl(const WriteOptions& write_options,
     stats->AddDBStats(InternalStats::kIntStatsNumKeysWritten, total_count);
     RecordTick(stats_, NUMBER_KEYS_WRITTEN, total_count);
 
-    while (writer.ConsumeOne())
-      ;
+    while (writer.ConsumeOne()) {
+    }
     MultiBatchWriteCommit(writer.request);
 
     WriteStatusCheck(writer.status);
@@ -1586,6 +1613,60 @@ Status DBImpl::MergeBatch(const WriteThread::WriteGroup& write_group,
   return Status::OK();
 }
 
+IOStatus DBImpl::PrepareWALRecords(WriteThread::Writer* writer,
+                                   log::Writer* log_writer) {
+  assert(writer != nullptr);
+  assert(log_writer != nullptr);
+  writer->prepared_wal_records.clear();
+  writer->prepared_wal_record_bytes = 0;
+  writer->prepared_write_with_wal = 0;
+  writer->prepared_recoverable_state = nullptr;
+
+  if (writer->CallbackFailed() || !writer->ShouldWriteToWAL()) {
+    return IOStatus::OK();
+  }
+
+  WriteBatch tmp_batch;
+  WriteBatch* wal_batch = nullptr;
+  if (writer->multi_batch.batches.size() == 1 &&
+      writer->multi_batch.batches[0]->GetWalTerminationPoint().is_cleared()) {
+    wal_batch = writer->multi_batch.batches[0];
+    writer->prepared_write_with_wal = 1;
+    if (WriteBatchInternal::IsLatestPersistentState(wal_batch)) {
+      writer->prepared_recoverable_state = wal_batch;
+    }
+  } else {
+    wal_batch = &tmp_batch;
+    for (auto b : writer->multi_batch.batches) {
+      Status s = WriteBatchInternal::Append(wal_batch, b, /*WAL_only*/ true);
+      if (!s.ok()) {
+        return status_to_io_status(std::move(s));
+      }
+      if (WriteBatchInternal::IsLatestPersistentState(b)) {
+        writer->prepared_recoverable_state = b;
+      }
+      writer->prepared_write_with_wal++;
+    }
+    WriteBatchInternal::SetSequence(wal_batch, writer->sequence);
+  }
+
+  Status s = wal_batch->VerifyChecksum();
+  if (!s.ok()) {
+    return status_to_io_status(std::move(s));
+  }
+
+  Slice log_entry = WriteBatchInternal::Contents(wal_batch);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:log_entry", &log_entry);
+  writer->prepared_wal_record_bytes = log_entry.size();
+  std::string prepared_record;
+  IOStatus io_s = log_writer->PrepareRecord(log_entry, &prepared_record);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  writer->prepared_wal_records.emplace_back(std::move(prepared_record));
+  return IOStatus::OK();
+}
+
 // When two_write_queues_ is disabled, this function is called from the only
 // write thread. Otherwise this must be called holding log_write_mutex_.
 IOStatus DBImpl::WriteToWAL(const WriteBatch& merged_batch,
@@ -1716,6 +1797,106 @@ IOStatus DBImpl::WriteToWAL(const WriteThread::WriteGroup& write_group,
   if (merged_batch == &tmp_batch_) {
     tmp_batch_.Clear();
   }
+  if (io_s.ok()) {
+    auto stats = default_cf_internal_stats_;
+    if (need_log_sync) {
+      stats->AddDBStats(InternalStats::kIntStatsWalFileSynced, 1);
+      RecordTick(stats_, WAL_FILE_SYNCED);
+    }
+    stats->AddDBStats(InternalStats::kIntStatsWalFileBytes, log_size);
+    RecordTick(stats_, WAL_FILE_BYTES, log_size);
+    stats->AddDBStats(InternalStats::kIntStatsWriteWithWal, write_with_wal);
+    RecordTick(stats_, WRITE_WITH_WAL, write_with_wal);
+  }
+  return io_s;
+}
+
+IOStatus DBImpl::WritePreparedWALRecords(
+    const WriteThread::WriteGroup& write_group, log::Writer* log_writer,
+    uint64_t* log_used, bool need_log_sync, bool need_log_dir_sync,
+    LogFileNumberSize& log_file_number_size) {
+  IOStatus io_s;
+  assert(!two_write_queues_);
+  assert(!write_group.leader->disable_wal);
+
+  StopWatch write_sw(immutable_db_options_.clock, stats_, DB_WRITE_WAL_TIME);
+  size_t write_with_wal = 0;
+  size_t prepared_record_count = 0;
+  uint64_t log_size = 0;
+  for (auto writer : write_group) {
+    prepared_record_count += writer->prepared_wal_records.size();
+  }
+
+  const bool needs_locking = manual_wal_flush_ && !two_write_queues_;
+  if (UNLIKELY(needs_locking)) {
+    log_write_mutex_.Lock();
+  }
+  io_s = log_writer->MaybeAddUserDefinedTimestampSizeRecord(
+      versions_->GetColumnFamiliesTimestampSizeForRecord(),
+      write_group.leader->rate_limiter_priority);
+  if (io_s.ok()) {
+    size_t prepared_record_index = 0;
+    for (auto writer : write_group) {
+      if (writer->prepared_wal_records.empty()) {
+        continue;
+      }
+      writer->log_used = logfile_number_;
+      write_with_wal += writer->prepared_write_with_wal;
+      log_size += writer->prepared_wal_record_bytes;
+      for (const auto& record : writer->prepared_wal_records) {
+        ++prepared_record_index;
+        io_s = log_writer->AddPreparedRecord(
+            Slice(record), writer->rate_limiter_priority,
+            /*flush=*/prepared_record_index == prepared_record_count);
+        if (!io_s.ok()) {
+          break;
+        }
+      }
+      if (writer->prepared_recoverable_state != nullptr) {
+        cached_recoverable_state_ = *writer->prepared_recoverable_state;
+        cached_recoverable_state_empty_ = false;
+      }
+      if (!io_s.ok()) {
+        break;
+      }
+    }
+  }
+  if (UNLIKELY(needs_locking)) {
+    log_write_mutex_.Unlock();
+  }
+
+  if (log_used != nullptr) {
+    *log_used = logfile_number_;
+  }
+  total_log_size_ += log_size;
+  log_file_number_size.AddSize(log_size);
+  log_empty_ = false;
+
+  if (io_s.ok() && need_log_sync) {
+    StopWatch sw(immutable_db_options_.clock, stats_, WAL_FILE_SYNC_MICROS);
+
+    if (UNLIKELY(needs_locking)) {
+      log_write_mutex_.Lock();
+    }
+
+    for (auto& log : logs_) {
+      io_s = log.writer->file()->Sync(immutable_db_options_.use_fsync);
+      if (!io_s.ok()) {
+        break;
+      }
+    }
+
+    if (UNLIKELY(needs_locking)) {
+      log_write_mutex_.Unlock();
+    }
+
+    if (io_s.ok() && need_log_dir_sync) {
+      io_s = directories_.GetWalDir()->FsyncWithDirOptions(
+          IOOptions(), nullptr,
+          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+    }
+  }
+
   if (io_s.ok()) {
     auto stats = default_cf_internal_stats_;
     if (need_log_sync) {

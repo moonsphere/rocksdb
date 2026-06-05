@@ -64,6 +64,10 @@ IOStatus Writer::Close() {
 
 IOStatus Writer::AddRecord(const Slice& slice,
                            Env::IOPriority rate_limiter_priority) {
+  if (!compress_) {
+    return EmitLogicalRecord(slice, rate_limiter_priority);
+  }
+
   const char* ptr = slice.data();
   size_t left = slice.size();
 
@@ -159,6 +163,61 @@ IOStatus Writer::AddRecord(const Slice& slice,
   return s;
 }
 
+IOStatus Writer::PrepareRecord(const Slice& slice, std::string* prepared) {
+  assert(prepared != nullptr);
+  prepared->clear();
+  if (!compress_) {
+    prepared->assign(slice.data(), slice.size());
+    return IOStatus::OK();
+  }
+
+  const size_t max_output_buffer_len =
+      kBlockSize - (recycle_log_files_ ? kRecyclableHeaderSize : kHeaderSize);
+  CompressionOptions opts;
+  constexpr uint32_t compression_format_version = 2;
+  std::unique_ptr<StreamingCompress> compressor(StreamingCompress::Create(
+      compression_type_, opts, compression_format_version,
+      max_output_buffer_len));
+  if (!compressor) {
+    IOStatus s = IOStatus::IOError("Unexpected WAL compression error");
+    s.SetDataLoss(true);
+    return s;
+  }
+  std::unique_ptr<char[]> compressed_buffer(new char[max_output_buffer_len]);
+  compressor->Reset();
+
+  if (slice.empty()) {
+    return IOStatus::OK();
+  }
+
+  int compress_remaining = 0;
+  do {
+    size_t compressed_size = 0;
+    compress_remaining = compressor->Compress(
+        slice.data(), slice.size(), compressed_buffer.get(), &compressed_size);
+    if (compress_remaining < 0) {
+      IOStatus s = IOStatus::IOError("Unexpected WAL compression error");
+      s.SetDataLoss(true);
+      return s;
+    }
+    if (compressed_size > 0) {
+      prepared->append(compressed_buffer.get(), compressed_size);
+    } else if (compress_remaining > 0) {
+      IOStatus s = IOStatus::IOError("Unexpected WAL compression error");
+      s.SetDataLoss(true);
+      return s;
+    }
+  } while (compress_remaining > 0);
+
+  return IOStatus::OK();
+}
+
+IOStatus Writer::AddPreparedRecord(const Slice& slice,
+                                   Env::IOPriority rate_limiter_priority,
+                                   bool flush) {
+  return EmitLogicalRecord(slice, rate_limiter_priority, flush);
+}
+
 IOStatus Writer::AddCompressionTypeRecord() {
   // Should be the first record
   assert(block_offset_ == 0);
@@ -224,6 +283,71 @@ IOStatus Writer::MaybeAddUserDefinedTimestampSizeRecord(
 }
 
 bool Writer::BufferIsEmpty() { return dest_->BufferIsEmpty(); }
+
+IOStatus Writer::EmitLogicalRecord(const Slice& slice,
+                                   Env::IOPriority rate_limiter_priority,
+                                   bool flush) {
+  const char* ptr = slice.data();
+  size_t left = slice.size();
+
+  // Header size varies depending on whether we are recycling or not.
+  const int header_size =
+      recycle_log_files_ ? kRecyclableHeaderSize : kHeaderSize;
+
+  // Fragment the record if necessary and emit it.  Note that if slice
+  // is empty, we still want to iterate once to emit a single
+  // zero-length record.
+  bool begin = true;
+  IOStatus s;
+  do {
+    const int64_t leftover = kBlockSize - block_offset_;
+    assert(leftover >= 0);
+    if (leftover < header_size) {
+      // Switch to a new block
+      if (leftover > 0) {
+        // Fill the trailer (literal below relies on kHeaderSize and
+        // kRecyclableHeaderSize being <= 11)
+        assert(header_size <= 11);
+        s = dest_->Append(Slice("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+                                static_cast<size_t>(leftover)),
+                          0 /* crc32c_checksum */, rate_limiter_priority);
+        if (!s.ok()) {
+          break;
+        }
+      }
+      block_offset_ = 0;
+    }
+
+    // Invariant: we never leave < header_size bytes in a block.
+    assert(static_cast<int64_t>(kBlockSize - block_offset_) >= header_size);
+
+    const size_t avail = kBlockSize - block_offset_ - header_size;
+    const size_t fragment_length = (left < avail) ? left : avail;
+
+    RecordType type;
+    const bool end = (left == fragment_length);
+    if (begin && end) {
+      type = recycle_log_files_ ? kRecyclableFullType : kFullType;
+    } else if (begin) {
+      type = recycle_log_files_ ? kRecyclableFirstType : kFirstType;
+    } else if (end) {
+      type = recycle_log_files_ ? kRecyclableLastType : kLastType;
+    } else {
+      type = recycle_log_files_ ? kRecyclableMiddleType : kMiddleType;
+    }
+
+    s = EmitPhysicalRecord(type, ptr, fragment_length, rate_limiter_priority);
+    ptr += fragment_length;
+    left -= fragment_length;
+    begin = false;
+  } while (s.ok() && left > 0);
+
+  if (s.ok() && flush && !manual_flush_) {
+    s = dest_->Flush(rate_limiter_priority);
+  }
+
+  return s;
+}
 
 IOStatus Writer::EmitPhysicalRecord(RecordType t, const char* ptr, size_t n,
                                     Env::IOPriority rate_limiter_priority) {

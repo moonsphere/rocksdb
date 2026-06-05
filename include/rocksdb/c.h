@@ -1778,7 +1778,11 @@ enum {
   rocksdb_blob_decompress_time,
   rocksdb_internal_range_del_reseek_count,
   rocksdb_block_read_cpu_time,
-  rocksdb_total_metric_count = 79
+  rocksdb_write_wal_precompress_time,
+  rocksdb_write_wal_precompress_bytes,
+  rocksdb_write_wal_precompress_records,
+  rocksdb_write_wal_precompress_group_size,
+  rocksdb_total_metric_count = 83
 };
 
 extern ROCKSDB_LIBRARY_API void rocksdb_set_perf_level(int);

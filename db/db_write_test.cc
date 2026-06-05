@@ -873,6 +873,7 @@ TEST_P(DBWriteTest, MultiBatchWriteWithCompressedWALPrecompression) {
   constexpr int kNumThreads = 4;
   constexpr int kNumBatches = 2;
   options.wal_compression = kZSTD;
+  options.statistics = CreateDBStatistics();
   options.write_buffer_size = 1024 * 1024 * 128;
   Reopen(options);
 
@@ -926,6 +927,17 @@ TEST_P(DBWriteTest, MultiBatchWriteWithCompressedWALPrecompression) {
 
   ASSERT_EQ(1, leader_count);
   ASSERT_GT(precompress_count, 0);
+  ASSERT_GT(options.statistics->getTickerCount(WAL_PRECOMPRESS_BYTES), 0);
+  ASSERT_GT(options.statistics->getTickerCount(WAL_PRECOMPRESS_RECORDS), 0);
+  HistogramData precompress_micros;
+  options.statistics->histogramData(WAL_PRECOMPRESS_MICROS,
+                                    &precompress_micros);
+  ASSERT_GT(precompress_micros.count, 0);
+  HistogramData precompress_group_size;
+  options.statistics->histogramData(WAL_PRECOMPRESS_GROUP_SIZE,
+                                    &precompress_group_size);
+  ASSERT_GT(precompress_group_size.count, 0);
+  ASSERT_GE(precompress_group_size.max, 2);
 
   Reopen(options);
   for (int t = 0; t < kNumThreads; t++) {

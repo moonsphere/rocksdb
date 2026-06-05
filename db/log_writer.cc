@@ -20,6 +20,55 @@
 
 namespace ROCKSDB_NAMESPACE {
 namespace log {
+namespace {
+
+constexpr uint32_t kWALCompressionFormatVersion = 2;
+
+IOStatus UnexpectedCompressionError() {
+  IOStatus s = IOStatus::IOError("Unexpected WAL compression error");
+  s.SetDataLoss(true);
+  return s;
+}
+
+class PreparedRecordCompressionScratch {
+ public:
+  IOStatus Prepare(CompressionType compression_type, bool recycle_log_files) {
+    const size_t max_output_buffer_len =
+        kBlockSize - (recycle_log_files ? kRecyclableHeaderSize : kHeaderSize);
+    if (compressor_ == nullptr || compression_type_ != compression_type ||
+        recycle_log_files_ != recycle_log_files ||
+        max_output_buffer_len_ != max_output_buffer_len) {
+      CompressionOptions opts;
+      std::unique_ptr<StreamingCompress> compressor(StreamingCompress::Create(
+          compression_type, opts, kWALCompressionFormatVersion,
+          max_output_buffer_len));
+      if (!compressor) {
+        return UnexpectedCompressionError();
+      }
+      compressor_ = std::move(compressor);
+      compressed_buffer_.reset(new char[max_output_buffer_len]);
+      compression_type_ = compression_type;
+      recycle_log_files_ = recycle_log_files;
+      max_output_buffer_len_ = max_output_buffer_len;
+    }
+    compressor_->Reset();
+    return IOStatus::OK();
+  }
+
+  StreamingCompress* compressor() { return compressor_.get(); }
+  char* compressed_buffer() { return compressed_buffer_.get(); }
+
+ private:
+  CompressionType compression_type_ = kNoCompression;
+  bool recycle_log_files_ = false;
+  size_t max_output_buffer_len_ = 0;
+  std::unique_ptr<StreamingCompress> compressor_;
+  std::unique_ptr<char[]> compressed_buffer_;
+};
+
+thread_local PreparedRecordCompressionScratch prepared_record_compression_scratch;
+
+}  // namespace
 
 Writer::Writer(std::unique_ptr<WritableFileWriter>&& dest, uint64_t log_number,
                bool recycle_log_files, bool manual_flush,
@@ -171,41 +220,32 @@ IOStatus Writer::PrepareRecord(const Slice& slice, std::string* prepared) {
     return IOStatus::OK();
   }
 
-  const size_t max_output_buffer_len =
-      kBlockSize - (recycle_log_files_ ? kRecyclableHeaderSize : kHeaderSize);
-  CompressionOptions opts;
-  constexpr uint32_t compression_format_version = 2;
-  std::unique_ptr<StreamingCompress> compressor(StreamingCompress::Create(
-      compression_type_, opts, compression_format_version,
-      max_output_buffer_len));
-  if (!compressor) {
-    IOStatus s = IOStatus::IOError("Unexpected WAL compression error");
-    s.SetDataLoss(true);
-    return s;
-  }
-  std::unique_ptr<char[]> compressed_buffer(new char[max_output_buffer_len]);
-  compressor->Reset();
-
   if (slice.empty()) {
     return IOStatus::OK();
   }
+
+  IOStatus s = prepared_record_compression_scratch.Prepare(compression_type_,
+                                                           recycle_log_files_);
+  if (!s.ok()) {
+    return s;
+  }
+  StreamingCompress* compressor =
+      prepared_record_compression_scratch.compressor();
+  char* compressed_buffer =
+      prepared_record_compression_scratch.compressed_buffer();
 
   int compress_remaining = 0;
   do {
     size_t compressed_size = 0;
     compress_remaining = compressor->Compress(
-        slice.data(), slice.size(), compressed_buffer.get(), &compressed_size);
+        slice.data(), slice.size(), compressed_buffer, &compressed_size);
     if (compress_remaining < 0) {
-      IOStatus s = IOStatus::IOError("Unexpected WAL compression error");
-      s.SetDataLoss(true);
-      return s;
+      return UnexpectedCompressionError();
     }
     if (compressed_size > 0) {
-      prepared->append(compressed_buffer.get(), compressed_size);
+      prepared->append(compressed_buffer, compressed_size);
     } else if (compress_remaining > 0) {
-      IOStatus s = IOStatus::IOError("Unexpected WAL compression error");
-      s.SetDataLoss(true);
-      return s;
+      return UnexpectedCompressionError();
     }
   } while (compress_remaining > 0);
 
@@ -240,9 +280,8 @@ IOStatus Writer::AddCompressionTypeRecord() {
     const size_t max_output_buffer_len =
         kBlockSize - (recycle_log_files_ ? kRecyclableHeaderSize : kHeaderSize);
     CompressionOptions opts;
-    constexpr uint32_t compression_format_version = 2;
     compress_ = StreamingCompress::Create(compression_type_, opts,
-                                          compression_format_version,
+                                          kWALCompressionFormatVersion,
                                           max_output_buffer_len);
     assert(compress_ != nullptr);
     compressed_buffer_ =

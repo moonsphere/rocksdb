@@ -334,6 +334,10 @@ Status DBImpl::MultiBatchWriteImpl(const WriteOptions& write_options,
       if (!write_options.disableWAL) {
         if (log_context.writer->IsCompressionEnabled() &&
             wal_write_group.size > 1) {
+          PERF_COUNTER_ADD(write_wal_precompress_group_size,
+                           wal_write_group.size);
+          RecordInHistogram(stats_, WAL_PRECOMPRESS_GROUP_SIZE,
+                            wal_write_group.size);
           write_thread_.LaunchParallelWalPrecompressors(&wal_write_group,
                                                         log_context.writer);
           writer.status = PrepareWALRecords(&writer, log_context.writer);
@@ -1659,10 +1663,20 @@ IOStatus DBImpl::PrepareWALRecords(WriteThread::Writer* writer,
   TEST_SYNC_POINT_CALLBACK("DBImpl::WriteToWAL:log_entry", &log_entry);
   writer->prepared_wal_record_bytes = log_entry.size();
   std::string prepared_record;
+  uint64_t precompress_micros = 0;
+  StopWatch precompress_sw(immutable_db_options_.clock, stats_,
+                           WAL_PRECOMPRESS_MICROS,
+                           Histograms::HISTOGRAM_ENUM_MAX,
+                           &precompress_micros);
+  PERF_TIMER_GUARD(write_wal_precompress_time);
   IOStatus io_s = log_writer->PrepareRecord(log_entry, &prepared_record);
   if (!io_s.ok()) {
     return io_s;
   }
+  PERF_COUNTER_ADD(write_wal_precompress_bytes, log_entry.size());
+  PERF_COUNTER_ADD(write_wal_precompress_records, 1);
+  RecordTick(stats_, WAL_PRECOMPRESS_BYTES, log_entry.size());
+  RecordTick(stats_, WAL_PRECOMPRESS_RECORDS, 1);
   writer->prepared_wal_records.emplace_back(std::move(prepared_record));
   return IOStatus::OK();
 }

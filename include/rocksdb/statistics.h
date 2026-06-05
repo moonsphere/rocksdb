@@ -177,6 +177,10 @@ enum Tickers : uint32_t {
   GET_UPDATES_SINCE_CALLS,
   WAL_FILE_SYNCED,  // Number of times WAL sync is done
   WAL_FILE_BYTES,   // Number of bytes written to WAL
+  // Number of uncompressed bytes prepared by parallel WAL precompression.
+  WAL_PRECOMPRESS_BYTES,
+  // Number of WAL logical records prepared by parallel WAL precompression.
+  WAL_PRECOMPRESS_RECORDS,
 
   // Writes can be processed by requesting thread or by the thread at the
   // head of the writers queue.
@@ -637,6 +641,8 @@ enum Histograms : uint32_t {
   FLUSH_TIME,
   SST_BATCH_SIZE,
   DB_WRITE_WAL_TIME,
+  WAL_PRECOMPRESS_MICROS,
+  WAL_PRECOMPRESS_GROUP_SIZE,
 
   // MultiGet stats logged per level
   // Num of index and filter blocks read from file system per level.
